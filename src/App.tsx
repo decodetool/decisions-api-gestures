@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   b64Vecs,
   createShapeId,
@@ -14,16 +14,19 @@ import {
 } from "tldraw";
 
 import { CANVAS_THEMES } from "./theme";
-import { strokeEndpoints, arrowPaths, arrowEvidencePaths, arcBend, boundsOverlap, segmentDistance, acceptedArrowEdit, nearestBareEnd, type ArrowEditEvidence, type Point, type Shaft } from "./arrow-geometry";
+import { strokeEndpoints, arrowPaths, arcBend, boundsOverlap, acceptedArrowEdit, type ArrowEditEvidence, type Point, type Shaft } from "./arrow-geometry";
 
 import { collectScratchShapes } from "./erase-targets";
 import { bindArrowTips } from "./connections";
-import { arrowEraseHit } from "./scratch-geometry";
+import { dismissStroke } from "./stroke-feedback";
 
 const MAGIC_TOOL_ID = "magic-pen";
 const BLUE = "blue" as const;
 const MIN_CONFIDENCE = 0.6;
 const SHAPE_BLUE = "light-blue" as const;
+const STROKE_FADE_MS = 75;
+type CallTiming = { apiMs: number | null; costUsd: number | null; receivedAt: number };
+type LatencyRow = { apiMs: number | null; costUsd: number | null; uxMs: number };
 
 type RecognitionLabel = "line" | "arc" | "rectangle" | "circle" | "none";
 
@@ -90,28 +93,26 @@ function getStrokePoints(editor: Editor, shape: TLDrawShape): Point[] {
   );
 }
 
-function fadeAndDelete(editor: Editor, shape: TLDrawShape) {
-  editor.updateShape({ id: shape.id, type: "draw", opacity: 0.55, meta: { ...shape.meta, magicPenFeedback: true } });
-  window.setTimeout(() => editor.updateShape({ id: shape.id, type: "draw", opacity: 0.1 }), 180);
-  window.setTimeout(() => editor.deleteShape(shape.id), 520);
+function fadeAndDelete(editor: Editor, shape: TLDrawShape, duration: number) {
+  dismissStroke(editor, shape, duration);
 }
 
 // Feedback is a separate transient shape so undo restores the target without
 // bringing the erase gesture back. Keep its animation outside history.
-function showStrokeFeedback(editor: Editor, stroke: TLDrawShape, color: "yellow" | "red") {
+function showStrokeFeedback(editor: Editor, stroke: TLDrawShape, color: "yellow" | "red", duration: number) {
   const current = editor.getShape(stroke.id);
   if (!current || current.type !== "draw") return;
+  if (duration === 0) { dismissStroke(editor, current, 0); return; }
   const feedback = { ...current, meta: { ...current.meta, magicPenFeedback: true }, id: createShapeId(), opacity: 1, props: { ...current.props, color } };
   editor.run(() => {
     editor.deleteShape(stroke.id);
     editor.createShape(feedback);
   }, { history: "ignore" });
-  window.setTimeout(() => editor.run(() => editor.updateShape({ id: feedback.id, type: "draw", opacity: 0.5 }), { history: "ignore" }), 400);
-  window.setTimeout(() => editor.run(() => editor.deleteShape(feedback.id), { history: "ignore" }), 750);
+  dismissStroke(editor, feedback, duration);
 }
 
-function rejectStroke(editor: Editor, stroke: TLDrawShape) {
-  showStrokeFeedback(editor, stroke, "yellow");
+function rejectStroke(editor: Editor, stroke: TLDrawShape, duration: number) {
+  showStrokeFeedback(editor, stroke, "yellow", duration);
 }
 
 function fixedShapeStyle(shape: TLShape): TLShape {
@@ -129,7 +130,7 @@ function selectMagicPen(editor: Editor) {
   editor.setStyleForNextShapes(DefaultColorStyle, BLUE);
 }
 
-function createRecognizedShape(editor: Editor, stroke: TLDrawShape, recognition: Recognition, points: Point[]) {
+function createRecognizedShape(editor: Editor, stroke: TLDrawShape, recognition: Recognition, points: Point[], duration: number) {
   const box = bounds(points);
   const common = { color: SHAPE_BLUE, fill: "solid" as const, dash: "solid" as const, size: "m" as const };
 
@@ -186,23 +187,31 @@ function createRecognizedShape(editor: Editor, stroke: TLDrawShape, recognition:
       }, meta: { magicPen: connections ? recognition.label : "line", confidence: recognition.confidence } });
     }
   }
-  fadeAndDelete(editor, stroke);
+  fadeAndDelete(editor, stroke, duration);
 }
 
-async function recognize(points: Point[], contextStrokes?: Point[][]): Promise<Recognition> {
+async function recognize(points: Point[], contextShaft?: Shaft, onCall?: (call: CallTiming) => void): Promise<Recognition> {
   // Quick flicks can contain only two or three pointer samples. Densify
   // those for the API while retaining the original attachment points.
   const evidence = points.length < 4 ? points.slice(1).flatMap((end, i) => [points[i],
     { x: points[i].x + (end.x - points[i].x) / 3, y: points[i].y + (end.y - points[i].y) / 3 },
     { x: points[i].x + (end.x - points[i].x) * 2 / 3, y: points[i].y + (end.y - points[i].y) * 2 / 3 },
   ]).concat([points.at(-1)!]) : points;
-  const response = await fetch("/api/recognize", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ points: evidence, contextStrokes }),
-  });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json() as Promise<Recognition>;
+  let apiMs: number | null = null;
+  let costUsd: number | null = null;
+  try {
+    const response = await fetch("/api/recognize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ points: evidence, contextStrokes: contextShaft ? arrowPaths(contextShaft) : undefined,
+        contextConnector: contextShaft ? { hasStart: contextShaft.hasStart, hasEnd: contextShaft.hasEnd } : undefined }),
+    });
+    const result = await response.json();
+    apiMs = Number.isFinite(result.apiLatencyMs) ? result.apiLatencyMs : null;
+    costUsd = Number.isFinite(result.estimatedCostUsd) && result.estimatedCostUsd >= 0 ? result.estimatedCostUsd : null;
+    if (!response.ok) throw new Error(result.error ?? "Recognition failed.");
+    return result as Recognition;
+  } finally { onCall?.({ apiMs, costUsd, receivedAt: performance.now() }); }
 }
 
 function getShaft(editor: Editor, arrow: TLArrowShape): Shaft | null {
@@ -227,23 +236,15 @@ function getShaft(editor: Editor, arrow: TLArrowShape): Shaft | null {
 const shaftKey = (shaft: Shaft | null) => JSON.stringify(shaft);
 type ScratchTarget = { shape: TLShape; terminal?: "start" | "end"; shaft?: Shaft };
 
-function findArrowCandidates(editor: Editor, stroke: TLDrawShape, points: Point[]) {
-  const shapes = editor.getCurrentPageShapesSorted();
-  const layers = new Map(shapes.map((shape, i) => [shape.id, i]));
-  return shapes.flatMap((shape, layer) => {
+function findArrowCandidates(editor: Editor, points: Point[]) {
+  // Bounding-box overlap only triggers the contextual classifier. Decisions
+  // determines actual contact, edit intent, and which endpoint to change.
+  return editor.getCurrentPageShapesSorted().flatMap((shape, layer) => {
     if (shape.type !== "arrow" || shape.isLocked || editor.isShapeHidden(shape)) return [];
     const shaft = getShaft(editor, shape);
     if (!shaft || !boundsOverlap(points, arrowPaths(shaft).flat(), 12 / editor.getZoomLevel())) return [];
-    const hit = arrowEraseHit(points, shaft, editor.getZoomLevel());
-    const visibleHeadHit = arrowEraseHit(points, shaft, editor.getZoomLevel(), (point) => {
-      const top = editor.getShapeAtPoint(point, { hitInside: true, hitLabels: true,
-        filter: (shape) => shape.id !== stroke.id && shape.type !== "draw" });
-      return !top || (layers.get(top.id) ?? -1) <= layer;
-    });
-    const distance = Math.min(...points.map((p) => Math.min(...arrowPaths(shaft).flatMap((path) =>
-      path.slice(1).map((end, i) => segmentDistance(p, path[i], end))))));
-    return [{ shape, shaft, hit, visibleHeadHit, distance, layer }];
-  }).sort((a, b) => a.distance - b.distance || b.layer - a.layer);
+    return [{ shape, shaft, layer }];
+  }).sort((a, b) => b.layer - a.layer);
 }
 
 function findScratchTargets(editor: Editor, stroke: TLDrawShape, points: Point[]): ScratchTarget[] {
@@ -257,8 +258,8 @@ function isTargetCurrent(editor: Editor, target: ScratchTarget) {
     (!target.shaft || target.shape.type !== "arrow" || shaftKey(getShaft(editor, target.shape)) === shaftKey(target.shaft));
 }
 
-function applyScratch(editor: Editor, stroke: TLDrawShape, targets: ScratchTarget[]) {
-  showStrokeFeedback(editor, stroke, "red");
+function applyScratch(editor: Editor, stroke: TLDrawShape, targets: ScratchTarget[], duration: number) {
+  showStrokeFeedback(editor, stroke, "red", duration);
   editor.markHistoryStoppingPoint("Scratch out");
   const currentTargets = targets.filter((target) => isTargetCurrent(editor, target));
   editor.run(() => {
@@ -277,51 +278,60 @@ type AppProps = { onEditor?: (editor: Editor) => void };
 
 function MagicPenCanvas({ onEditor }: AppProps) {
   const [editor, setEditor] = useState<Editor | null>(null);
+  const [latencies, setLatencies] = useState<LatencyRow[]>([]);
+  const releases = useRef(new Map<string, number>());
 
   useEffect(() => {
     if (!editor) return;
     selectMagicPen(editor);
     const removeCreateStyle = editor.store.sideEffects.registerBeforeCreateHandler("shape", (shape) => {
       const styled = fixedShapeStyle(shape);
+      if (styled.type === "draw" && styled.props.isComplete && !styled.meta.magicPenFeedback) {
+        releases.current.set(styled.id, performance.now());
+      }
       return styled.type === "draw" && !styled.meta.magicPenFeedback && editor.getCurrentToolId() === MAGIC_TOOL_ID
         ? { ...styled, props: { ...styled.props, color: BLUE } } : styled;
     });
-    const removeChangeStyle = editor.store.sideEffects.registerBeforeChangeHandler("shape", (_previous, next) => fixedShapeStyle(next));
+    const removeChangeStyle = editor.store.sideEffects.registerBeforeChangeHandler("shape", (previous, next) => {
+      if (previous.type === "draw" && next.type === "draw" && !previous.props.isComplete && next.props.isComplete && !next.meta.magicPenFeedback) {
+        if (!releases.current.has(next.id)) releases.current.set(next.id, performance.now());
+      }
+      return fixedShapeStyle(next);
+    });
     editor.run(() => editor.updateShapes(editor.getCurrentPageShapes().map(fixedShapeStyle)), { history: "ignore" });
     const seen = new Set<string>();
     let disposed = false;
     let queue = Promise.resolve();
 
-    async function processStroke(stroke: TLDrawShape, pageId: string) {
+    async function processStroke(stroke: TLDrawShape, pageId: string, releasedAt: number) {
       if (disposed || !editor) return;
       const isCurrent = () => !disposed && editor.getCurrentPageId() === pageId && editor.getShape(stroke.id)?.type === "draw";
       if (!isCurrent()) { seen.delete(stroke.id); return; }
       const points = getStrokePoints(editor, stroke);
-      if (points.length < 2) { rejectStroke(editor, stroke); return; }
+      if (points.length < 2) { rejectStroke(editor, stroke, STROKE_FADE_MS); return; }
+      const calls: CallTiming[] = [];
+      const onCall = (call: CallTiming) => calls.push(call);
+      let applied = false;
       try {
         const targets = findScratchTargets(editor, stroke, points);
-        const candidates = findArrowCandidates(editor, stroke, points);
+        const candidates = findArrowCandidates(editor, points);
         // Each overlapping connector is shown with the actual new gesture.
         // Shape/scratch recognition and connector edit checks run in parallel.
-        const [standalone, contextual] = await Promise.all([
-          recognize(points),
-          Promise.allSettled(candidates.map((candidate) => recognize(points, arrowEvidencePaths(candidate.shaft, points, editor!.getZoomLevel())))),
+        const [primary, ...contextual] = await Promise.allSettled([
+          recognize(points, undefined, onCall),
+          ...candidates.map((candidate) => recognize(points, candidate.shaft, onCall)),
         ]);
+        if (primary.status === "rejected") throw primary.reason;
+        const standalone = primary.value;
         const results = contextual.map((result) => result.status === "fulfilled" ? result.value : null);
         if (!isCurrent()) { seen.delete(stroke.id); return; }
+        applied = true;
         const edits = candidates.flatMap((candidate, i) => {
           if (!isTargetCurrent(editor, candidate)) return [];
           const result = results[i];
           if (!result) return [];
-          const bareEnd = nearestBareEnd(points, candidate.shaft, 18 / editor!.getZoomLevel());
-          const edit = acceptedArrowEdit(candidate.shaft, { ...result, headAdditionProbability: bareEnd ? result.headAdditionProbability : 0,
-            headCrossingProbability: candidate.visibleHeadHit?.terminal ? result.headCrossingProbability : 0 });
-          if (!edit) return [];
-          const terminal = edit === "add_head" ? bareEnd
-            : edit === "delete_head" ? candidate.visibleHeadHit?.terminal : undefined;
-          if ((edit === "add_head" || edit === "delete_head") && !terminal) return [];
-          if (edit === "delete_arrow" && !candidate.hit) return [];
-          return [{ candidate, edit, terminal }];
+          const accepted = acceptedArrowEdit(candidate.shaft, result);
+          return accepted ? [{ candidate, edit: accepted.kind, terminal: accepted.terminal }] : [];
         });
         // An explicit head addition takes priority over scratch classification.
         // No local crossing/reversal heuristic can delete this gesture first.
@@ -330,38 +340,37 @@ function MagicPenCanvas({ onEditor }: AppProps) {
           const { candidate, terminal } = addition;
           editor.updateShape({ id: candidate.shape.id, type: "arrow",
             props: { [terminal === "start" ? "arrowheadStart" : "arrowheadEnd"]: "arrow" } });
-          fadeAndDelete(editor, stroke);
+          fadeAndDelete(editor, stroke, STROKE_FADE_MS);
           return;
         }
         const headEdits = edits.filter(({ edit }) => edit === "delete_head");
         if (headEdits.length) {
-          applyScratch(editor, stroke, headEdits.map(({ candidate, terminal }) => ({ ...candidate, terminal: terminal! })));
+          applyScratch(editor, stroke, headEdits.map(({ candidate, terminal }) => ({ ...candidate, terminal: terminal! })), STROKE_FADE_MS);
           return;
         }
         const scratch = (standalone.scratchOutProbability ?? 0) >= 0.85;
-        if (scratch) {
-          const headHits = candidates.filter((candidate) => candidate.visibleHeadHit?.terminal && isTargetCurrent(editor, candidate));
-          if (headHits.length) {
-            applyScratch(editor, stroke, headHits.map((candidate) => ({ ...candidate, terminal: candidate.visibleHeadHit!.terminal })));
-          } else {
-            for (const candidate of candidates) {
-              if (candidate.hit && !targets.some((target) => target.shape.id === candidate.shape.id)) targets.push(candidate);
-            }
-            applyScratch(editor, stroke, targets);
-          }
-          return;
-        }
-        const deletions = edits.filter(({ edit }) => edit === "delete_arrow");
-        if (deletions.length) {
-          applyScratch(editor, stroke, deletions.map(({ candidate }) => candidate));
+        const deletions = edits.filter(({ edit }) => edit === "delete_arrow").map(({ candidate }) => candidate);
+        if (scratch || deletions.length) {
+          // Shape deletion still uses the standalone scratch classifier. Every
+          // connector must have its own accepted delete_arrow decision; a
+          // standalone scribble can never guess which head to remove.
+          const shapeTargets = scratch ? targets.filter((target) => target.shape.type !== "arrow") : [];
+          applyScratch(editor, stroke, [...shapeTargets, ...deletions], STROKE_FADE_MS);
           return;
         }
         const result = standalone;
         if (result && result.label !== "none" && (result.confidence ?? 0) >= MIN_CONFIDENCE) {
-          createRecognizedShape(editor, stroke, result, points);
-        } else rejectStroke(editor, stroke);
+          createRecognizedShape(editor, stroke, result, points, STROKE_FADE_MS);
+        } else rejectStroke(editor, stroke, STROKE_FADE_MS);
       } catch {
-        if (isCurrent()) rejectStroke(editor, stroke);
+        if (isCurrent()) { rejectStroke(editor, stroke, STROKE_FADE_MS); applied = true; }
+      } finally {
+        if (applied && calls.length) {
+          // All parallel checks share the moment their stroke's result was applied.
+          const uxMs = Math.round(performance.now() - releasedAt);
+          const rows = calls.sort((a, b) => b.receivedAt - a.receivedAt).map(({ apiMs, costUsd }) => ({ apiMs, costUsd, uxMs }));
+          setLatencies((previous) => [...rows, ...previous].slice(0, 3));
+        }
       }
     }
 
@@ -371,16 +380,24 @@ function MagicPenCanvas({ onEditor }: AppProps) {
         const stroke = shape as TLDrawShape;
         const pageId = editor.getCurrentPageId();
         seen.add(shape.id);
+        const releasedAt = releases.current.get(shape.id) ?? performance.now();
+        releases.current.delete(shape.id);
         // Queue recognition in drawing order. A quickly drawn second head can
         // then see the shaft created by the still-pending first request.
-        queue = queue.then(() => processStroke(stroke, pageId));
+        queue = queue.then(() => processStroke(stroke, pageId, releasedAt));
       }
     }, 90);
-    return () => { disposed = true; window.clearInterval(interval); removeCreateStyle(); removeChangeStyle(); };
+    return () => { disposed = true; window.clearInterval(interval); removeCreateStyle(); removeChangeStyle(); releases.current.clear(); };
   }, [editor]);
 
   return (
-    <div className="canvas-shell">
+    <div className="canvas-shell" onPointerUpCapture={() => {
+      if (!editor || editor.getCurrentToolId() !== MAGIC_TOOL_ID) return;
+      const releasedAt = performance.now();
+      for (const shape of editor.getCurrentPageShapes()) {
+        if (shape.type === "draw" && !shape.props.isComplete && !shape.meta.magicPenFeedback) releases.current.set(shape.id, releasedAt);
+      }
+    }}>
       <Tldraw
         themes={CANVAS_THEMES}
         tools={[MagicPenTool]}
@@ -391,6 +408,14 @@ function MagicPenCanvas({ onEditor }: AppProps) {
           onEditor?.(nextEditor);
         }}
       />
+      <table className="latency-display" aria-label="Last three recognition calls, newest first"
+        title="API: OpenAI send/receive only. UX: stroke release to applied result, including queue and network time; excludes the 75 ms fade. Parallel checks share UX time. Est. USD: returned input tokens at Decisions pricing ($0.10/million), not a billed amount. A dash means the timing or estimate is unavailable.">
+        <thead><tr><th>API ms</th><th>UX ms</th><th>Est. USD</th></tr></thead>
+        <tbody>{Array.from({ length: 3 }, (_, i) => <tr key={i}>
+          <td>{latencies[i]?.apiMs ?? "—"}</td><td>{latencies[i]?.uxMs ?? "—"}</td>
+          <td>{latencies[i]?.costUsd != null ? `$${latencies[i].costUsd.toFixed(7)}` : "—"}</td>
+        </tr>)}</tbody>
+      </table>
     </div>
   );
 }

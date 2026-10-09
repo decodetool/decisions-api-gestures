@@ -54,47 +54,20 @@ export function boundsOverlap(a: Point[], b: Point[], margin: number) {
   return x.maxX + margin >= y.minX && x.minX - margin <= y.maxX && x.maxY + margin >= y.minY && x.minY - margin <= y.maxY;
 }
 
-export type ArrowEdit = "keep" | "add_head" | "delete_arrow" | "delete_head";
-export type ArrowEditEvidence = {
-  headAdditionProbability?: number | null;
-  headCrossingProbability?: number | null;
-  shaftCrossingProbability?: number | null;
-};
-export function acceptedArrowEdit(shaft: Shaft, result: ArrowEditEvidence): Exclude<ArrowEdit, "keep"> | null {
-  if ((result.headAdditionProbability ?? 0) >= 0.65 && (!shaft.hasStart || !shaft.hasEnd)) return "add_head";
-  if ((result.headCrossingProbability ?? 0) >= 0.85 && (shaft.hasStart || shaft.hasEnd)) return "delete_head";
-  if ((result.shaftCrossingProbability ?? 0) >= 0.85) return "delete_arrow";
-  return null;
-}
+export type ConnectorEdit = "keep" | "add_tail" | "delete_tail" | "delete_arrow" | "add_head" | "delete_head";
+export type ArrowEditEvidence = { connectorEdit?: ConnectorEdit | null; connectorEditProbability?: number | null };
+export type AcceptedArrowEdit = { kind: "add_head" | "delete_head" | "delete_arrow"; terminal?: "start" | "end" };
 
-export function nearestBareEnd(points: Point[], shaft: Shaft, tolerance: number): "start" | "end" | null {
-  const ends = (["start", "end"] as const).filter((terminal) => terminal === "start" ? !shaft.hasStart : !shaft.hasEnd)
-    .map((terminal) => ({ terminal, distance: Math.min(...points.slice(1).map((p, i) => segmentDistance(shaft[terminal], points[i], p))) }))
-    .filter((end) => end.distance <= tolerance).sort((a, b) => a.distance - b.distance);
-  return ends.length === 1 ? ends[0].terminal : null;
-}
-
-// Make small head edits readable on a long connector. This only changes image
-// evidence; the actual arrow, contacts and endpoint bindings remain intact.
-export function arrowEvidencePaths(shaft: Shaft, points: Point[], zoom: number) {
-  const terminal = nearestBareEnd(points, shaft, 18 / zoom) ?? nearestBareEnd(points,
-    { ...shaft, hasStart: !shaft.hasStart, hasEnd: !shaft.hasEnd }, 30 / zoom);
-  const width = Math.max(...points.map((p) => p.x)) - Math.min(...points.map((p) => p.x));
-  const height = Math.max(...points.map((p) => p.y)) - Math.min(...points.map((p) => p.y));
-  if (!terminal || Math.max(width, height) > 120 / zoom) return arrowPaths(shaft);
-  const body = shaft.path ?? [shaft.start, shaft.end];
-  const ordered = terminal === "start" ? body : [...body].reverse();
-  const focused = [ordered[0]];
-  let remaining = 100 / zoom;
-  for (let i = 1; i < ordered.length && remaining > 0; i++) {
-    const length = distance(ordered[i - 1], ordered[i]);
-    const ratio = Math.min(1, remaining / (length || 1));
-    focused.push({ x: ordered[i - 1].x + (ordered[i].x - ordered[i - 1].x) * ratio,
-      y: ordered[i - 1].y + (ordered[i].y - ordered[i - 1].y) * ratio });
-    remaining -= length;
-  }
-  const all = arrowPaths(shaft);
-  const head = terminal === "start" ? (shaft.hasStart ? all[1] : undefined)
-    : (shaft.hasEnd ? all[shaft.hasStart ? 2 : 1] : undefined);
-  return [terminal === "start" ? focused : focused.reverse(), ...(head ? [head] : [])];
+// The model chooses the endpoint. Only check confidence and impossible state
+// changes here; never infer a different endpoint from gesture geometry.
+export function acceptedArrowEdit(shaft: Shaft, result: ArrowEditEvidence): AcceptedArrowEdit | null {
+  const edit = result.connectorEdit;
+  if (!edit || edit === "keep") return null;
+  const addition = edit === "add_tail" || edit === "add_head";
+  if ((result.connectorEditProbability ?? 0) < (addition ? 0.6 : edit === "delete_arrow" ? 0.65 : 0.85)) return null;
+  if (edit === "delete_arrow") return { kind: "delete_arrow" };
+  const terminal = edit.endsWith("tail") ? "start" : "end";
+  const exists = terminal === "start" ? shaft.hasStart : shaft.hasEnd;
+  if (addition === exists) return null;
+  return { kind: addition ? "add_head" : "delete_head", terminal };
 }

@@ -178,6 +178,24 @@ function Harness() {
         bindArrowTips(editor, id, { start: { x: 155, y: 300 }, end: { x: 450, y: 300 } }, createShapeId());
       }}>Create headed arc fixture</button>
       <button onClick={() => editor?.undo()}>Undo</button>
+      <button disabled={!editor} onClick={() => {
+        if (!editor) return;
+        editor.createShape({ id: START, type: "geo", x: 330, y: 180, props: { w: 120, h: 80, geo: "rectangle" } });
+        const id = createShapeId();
+        editor.createShape({ id, type: "arrow", x: 390, y: 220, props: { start: { x: 0, y: 0 }, end: { x: 0, y: 300 }, arrowheadStart: "none", arrowheadEnd: "arrow" } });
+        // Binding anchor is the box center; the editable visible tail is its bottom edge.
+        bindArrowTips(editor, id, { start: { x: 390, y: 220 }, end: { x: 390, y: 520 } }, createShapeId());
+      }}>Create vertical tail fixture</button>
+      <button onClick={() => {
+        if (!editor) return;
+        const tips = shaft(editor); if (!tips) return;
+        const next = tips.path[1], dx = next.x - tips.start.x, dy = next.y - tips.start.y, length = Math.hypot(dx, dy);
+        draw(editor, [
+          { x: tips.start.x + 28 * dx / length - 25 * dy / length, y: tips.start.y + 28 * dy / length + 25 * dx / length },
+          { x: tips.start.x - 8 * dx / length, y: tips.start.y - 8 * dy / length },
+          { x: tips.start.x + 28 * dx / length + 25 * dy / length, y: tips.start.y + 28 * dy / length - 25 * dx / length },
+        ]);
+      }}>Add tail V overlapping box edge</button>
       <pre data-testid="report" style={{ whiteSpace: "pre-wrap" }}>{report}</pre>
     </aside>
   </>;

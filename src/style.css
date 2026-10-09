@@ -32,3 +32,25 @@ body {
 .canvas-shell .tl-watermark_SEE-LICENSE {
   display: none !important;
 }
+
+/* Read-only timing overlay leaves the canvas beneath it drawable. */
+.latency-display {
+  position: absolute;
+  z-index: 500;
+  right: max(12px, env(safe-area-inset-right));
+  bottom: max(12px, env(safe-area-inset-bottom));
+  pointer-events: none;
+  border-collapse: separate;
+  border-spacing: 12px 4px;
+  border-radius: 8px;
+  background: #ffffffdf;
+  color: #475569;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.latency-display th { font-weight: 500; color: #64748b; }
+.latency-display td { min-width: 48px; }
+@media (max-width: 600px) {
+  .latency-display { bottom: max(84px, calc(env(safe-area-inset-bottom) + 84px)); }
+}

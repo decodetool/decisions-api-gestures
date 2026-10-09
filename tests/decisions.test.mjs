@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { performance } from "node:perf_hooks";
 import { createApp } from "../lib/api.mjs";
-import { labels, compactStroke, buildDecisionRequest, parseDecision, recognizeStroke } from "../lib/decisions.mjs";
+import { labels, connectorEdits, compactStroke, buildDecisionRequest, parseDecision, recognizeStroke } from "../lib/decisions.mjs";
 import { renderStrokeImage } from "../lib/stroke-image.mjs";
 import sharp from "sharp";
 import { cases } from "../scripts/check-shapes.mjs";
@@ -103,6 +104,19 @@ test("calls the dedicated endpoint with server credentials and never returns the
   assert.equal(JSON.stringify(result).includes("test-secret"), false);
 });
 
+test("API timing includes upstream response-body receipt and excludes other processing", async (t) => {
+  let now = 100;
+  t.mock.method(performance, "now", () => now);
+  const result = await recognizeStroke(compactStroke(points), {
+    apiKey: "test-secret",
+    fetchImpl: async () => {
+      now = 130; // Headers received; the body is still arriving.
+      return { ok: true, json: async () => { now = 180; return answer(); } };
+    },
+  });
+  assert.equal(result.apiLatencyMs, 80);
+});
+
 test("handles quota, invalid JSON and network timeouts without forwarding upstream secrets", async () => {
   await assert.rejects(recognizeStroke({}, {
     apiKey: "test-secret", fetchImpl: async () => new Response("test-secret", { status: 429 }),
@@ -151,6 +165,9 @@ test("HTTP API retains browser contract, measures latency and rejects bad stroke
   assert.equal(result.label, "line");
   assert.equal(result.confidence, 0.93);
   assert.ok(result.latencyMs >= 0);
+  assert.ok(result.apiLatencyMs >= 0);
+  assert.ok(result.latencyMs >= result.apiLatencyMs);
+  assert.equal(result.estimatedCostUsd, 0.00001);
   assert.equal(JSON.stringify(result).includes("test-secret"), false);
   assert.equal((await post(JSON.stringify({ points: [] }))).status, 422);
   assert.equal((await post("{")).status, 400);
@@ -159,32 +176,53 @@ test("HTTP API retains browser contract, measures latency and rejects bad stroke
   assert.equal(calls, 1);
 });
 
-test("overlap requests include a combined connector image and independent contextual edit predicates", async (t) => {
-  const base = await serve(t, { getApiKey: () => "test-secret", fetchImpl: async (_url, options) => {
-    const request = JSON.parse(options.body);
-    const images = request.input[0].content.filter((part) => part.type === "input_image");
-    assert.equal(images.length, 1);
-    assert.deepEqual(request.questions.map((question) => question.name), ["shaft_crossing", "head_crossing", "head_addition"]);
-    const body = { answers: [{ name: "head_addition", type: "predicate", probability: 0.98 }, { name: "shaft_crossing", type: "predicate", probability: 0 }, { name: "head_crossing", type: "predicate", probability: 0 }] };
-    return Response.json(body);
-  } });
-  const response = await fetch(`${base}/api/recognize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-    points,
-    contextStrokes: [[{ x: 0, y: 0 }, { x: 200, y: 0 }], [{ x: 170, y: -20 }, { x: 200, y: 0 }, { x: 170, y: 20 }]],
-  }) });
-  assert.equal(response.status, 200);
-  const result = await response.json();
-  assert.equal(result.headAdditionProbability, 0.98);
-  assert.equal(result.shaftCrossingProbability, 0);
+const editAnswer = (edit = "add_tail") => ({
+  model: "gpt-6-luna",
+  answers: connectorEdits.slice(1).map((name) => ({ name, type: "predicate", probability: name === edit ? 0.98 : 0.01 })),
+  usage: { input_tokens: 100 },
 });
 
-test("malformed contextual predicates cannot become deletion operations", () => {
-  for (const edit of [
-    { name: "shaft_crossing", type: "predicate", probability: 2 },
-    { name: "shaft_crossing", type: "refusal" },
-    { name: "head_addition", type: "predicate", probability: 0.99 },
-  ]) assert.throws(() => parseDecision({ answers: [edit] }), /invalid connector edit/);
-  assert.equal(parseDecision(answer()).shaftCrossingProbability, null);
+test("overlap requests ask the classifier for action AND endpoint with explicit existing-head flags", async (t) => {
+  const base = await serve(t, { getApiKey: () => "test-secret", fetchImpl: async (_url, options) => {
+    const request = JSON.parse(options.body);
+    assert.equal(request.input[0].content.filter((part) => part.type === "input_image").length, 2);
+    assert.deepEqual(request.questions.map((question) => question.name), connectorEdits.slice(1));
+    assert.ok(request.questions.every((q) => q.type === "predicate"));
+    assert.match(request.input[0].content[0].text, /TAIL has NO existing arrowhead/);
+    assert.match(request.input[0].content[0].text, /HEAD has an existing BLACK arrowhead/);
+    return Response.json(editAnswer());
+  } });
+  const body = { points,
+    contextStrokes: [[{ x: 0, y: 0 }, { x: 200, y: 0 }], [{ x: 170, y: -20 }, { x: 200, y: 0 }, { x: 170, y: 20 }]],
+    contextConnector: { hasStart: false, hasEnd: true },
+  };
+  const post = (body) => fetch(`${base}/api/recognize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const response = await post(body);
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.connectorEdit, "add_tail");
+  assert.equal(result.connectorEditProbability, 0.98);
+  assert.equal((await post({ ...body, contextConnector: undefined })).status, 422);
+  assert.equal((await post({ ...body, contextConnector: { hasStart: true, hasEnd: true } })).status, 422);
+  assert.equal((await post({ ...body, contextStrokes: [[{ x: 0, y: 0 }, { x: 0, y: 0 }]], contextConnector: { hasStart: false, hasEnd: false } })).status, 422);
+});
+
+test("malformed, refused, duplicated, or missing connector decisions cannot become edits", () => {
+  for (const value of ["delete_arrow", "add_tail", "delete_head", "keep"]) {
+    assert.equal(parseDecision(editAnswer(value), true).connectorEdit, value);
+  }
+  for (const mutate of [
+    (body) => { body.answers[0].name = "delete_unknown"; },
+    (body) => { body.answers[0].probability = 2; },
+    (body) => { body.answers.pop(); },
+    (body) => { body.answers[0].type = "choice"; },
+    (body) => { body.answers.push(body.answers[0]); },
+    (body) => { body.answers = []; },
+  ]) { const body = editAnswer(); mutate(body); assert.throws(() => parseDecision(body, true), /invalid connector edit/); }
+  const refusal = editAnswer(); refusal.answers[0].type = "refusal";
+  assert.throws(() => parseDecision(refusal, true), /declined/);
+  assert.throws(() => parseDecision(answer(), true), /invalid connector edit/);
+  assert.equal(parseDecision(answer()).connectorEdit, null);
 });
 
 test("tiny two-sample flicks are valid API evidence without requiring repeated passes", async () => {

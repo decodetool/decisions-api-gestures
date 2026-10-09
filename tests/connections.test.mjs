@@ -1,8 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { bindArrowTips } from "../src/connections.ts";
-import { sampleStroke } from "../src/scratch-geometry.ts";
-import { collectScratchShapes } from "../src/erase-targets.ts";
+import { collectScratchShapes, sampleStroke } from "../src/erase-targets.ts";
 
 test("binding makes exactly one topmost point lookup per tip and keeps precise local anchors", () => {
   const arrow = { id: "shape:arrow", type: "arrow" };
