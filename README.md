@@ -84,3 +84,27 @@ For a small live check of rectangles, squares, curved connectors, disabled singl
 - [TypeSafe / Jev introduction](https://docs.typesafe.ai/introduction)
 
 The shared confidence threshold is kept for prototype parity, but confidence from different models is not necessarily calibrated the same way. Evaluate real drawings before treating this as production recognition.
+
+## Private Vercel deployment
+
+Live URL: https://openai-decisions-magic-pen.vercel.app/
+
+The Vercel project `francoislaberges-projects/openai-decisions-magic-pen` has Vercel Authentication enabled for **all deployments**, including the stable domain. Sign in with the Vercel account that owns the project. Unauthenticated requests to both the canvas and `/api` redirect to login. Do not disable protection or distribute automation bypass credentials.
+
+`vercel.json` builds the frontend with `npm run build:private`: `NODE_ENV=development vite build --mode development`. This is an actual development frontend bundle, even when Vercel labels the deployment “Production.” The normal `npm run build` command still produces a production frontend. The deployed API remains a Node function: `api/index.js` exports the existing Express app, and `/api/:path*` rewrites to that function. It does not start the local Vite server.
+
+`OPENAI_API_KEY` is stored as a Vercel **Secret** for Preview and Production, read only by the server-side API. `.env`, `.env.*`, local Vercel state, and results are excluded from uploads / Git as appropriate. Never use a `VITE_` prefix for the OpenAI key. Changes to cloud environment variables require a new deployment.
+
+From this experiment directory, future deployments can use:
+
+```sh
+npx --yes vercel@latest deploy --prod --yes --scope francoislaberges-projects
+```
+
+For an authenticated health check using the CLI:
+
+```sh
+npx --yes vercel@latest curl /api/health --deployment https://openai-decisions-magic-pen.vercel.app --scope francoislaberges-projects
+```
+
+Vercel's CLI uses a private automation bypass for this request; the public deployment continues to require login. Keep `.vercel/` ignored because it can hold local project / automation credentials.
