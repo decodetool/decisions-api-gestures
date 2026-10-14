@@ -28,11 +28,6 @@ body {
   background: #f8fbff;
 }
 
-/* Keep the temporary recording prototype free of the license callout. */
-.canvas-shell .tl-watermark_SEE-LICENSE {
-  display: none !important;
-}
-
 /* Read-only timing overlay leaves the canvas beneath it drawable. */
 .latency-display {
   position: absolute;
