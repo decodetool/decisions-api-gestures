@@ -3,9 +3,6 @@ dist/
 .env
 .env.*
 !.env.example
+.vercel/
 *.tsbuildinfo
 results/
-
-.vercel/
-.vercel
-.env*
